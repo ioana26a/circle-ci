@@ -1,0 +1,105 @@
+version: 2.1
+
+jobs:
+  test-app:
+    docker:
+      - image: cimg/python:3.10
+    working_directory: ~/project
+    steps:
+      - checkout
+      - run:
+          name: Install dependencies
+          command: |
+            cd app
+            python -m venv venv
+            . venv/bin/activate
+            pip install --upgrade pip
+            pip install -r requirements.txt
+      - run:
+          name: Run tests
+          command: |
+            cd app
+            . venv/bin/activate
+            pytest test_app.py
+            flake8 . --exclude=venv
+
+  build-and-push:
+    docker:
+      - image: cimg/python:3.10
+    working_directory: ~/project
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Build Docker image
+          command: |
+            cd app
+            docker compose build
+            docker tag app-web:latest app-web:mytag
+            docker tag app-web:latest $ACCOUNT_ID.dkr.ecr.eu-north-1.amazonaws.com/$ECR_REPO:mytag
+      - run:
+          name: Install AWS CLI
+          command: |
+            sudo apt-get update
+            sudo apt-get install -y awscli
+      - run:
+          name: Login to AWS ECR
+          command: |
+            aws ecr get-login-password --region eu-north-1 | docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.eu-north-1.amazonaws.com
+      - run:
+          name: Push Docker image to ECR
+          command: |
+            docker push $ACCOUNT_ID.dkr.ecr.eu-north-1.amazonaws.com/$ECR_REPO:mytag
+  deploy-ec2:
+    machine: true
+    steps:
+      - checkout
+      - add_ssh_keys:
+          fingerprints:
+            - "SHA256:TwXLeAWA0HI9G/UFOEW2LMWGFogbSqddFzgy/7wx3Gs"
+      - run:
+          name: Generate deployment script
+          command: |
+            cat > deploy_ec2.sh \<< EOF
+            export ECR_REGISTRY="${ACCOUNT_ID}.dkr.ecr.eu-north-1.amazonaws.com"
+            export ECR_REPO="${ECR_REPO}"
+            export IMAGE_TAG="mytag"
+            export AWS_REGION="eu-north-1"
+
+            echo ECR_REGISTRY: \$ECR_REGISTRY
+            echo ECR_REPO: \$ECR_REPO
+            echo IMAGE_TAG: \$IMAGE_TAG
+
+            # 4. Authenticate to ECR
+            aws ecr get-login-password --region \$AWS_REGION | docker login --username AWS --password-stdin \$ECR_REGISTRY
+
+            # 5. Pull Docker image
+            docker pull \$ECR_REGISTRY/\$ECR_REPO:\$IMAGE_TAG
+
+            # 6. Stop and remove old container
+            docker stop my-app || true
+            docker rm my-app || true
+
+            # 7. Run new container
+            docker run -d --name my-app -p 80:80 \$ECR_REGISTRY/\$ECR_REPO:\$IMAGE_TAG
+            EOF
+      - run:
+          name: Copy and run deployment script on EC2
+          command: |
+            scp -o StrictHostKeyChecking=no deploy_ec2.sh $USER@$EC2_HOST:/home/ubuntu/deploy_ec2.sh
+            ssh -o StrictHostKeyChecking=no $USER@$EC2_HOST 'chmod +x /home/ubuntu/deploy_ec2.sh && /home/ubuntu/deploy_ec2.sh'
+
+workflows:
+  version: 2
+  build-test-deploy:
+    jobs:
+      - test-app
+      - build-and-push:
+          requires:
+            - test-app
+      - deploy-ec2:
+          requires:
+            - build-and-push
+          filters:
+            branches:
+              only: main
